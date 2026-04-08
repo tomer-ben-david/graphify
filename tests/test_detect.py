@@ -105,6 +105,63 @@ def test_graphifyignore_comments_ignored(tmp_path):
     assert any("other.py" in f for f in result["files"]["code"])
 
 
+def test_gitignore_negation_reincludes_file(tmp_path):
+    """Later !rules should restore files excluded by earlier .gitignore patterns."""
+    (tmp_path / ".gitignore").write_text("generated/*\n!generated/keep.py\n")
+    generated = tmp_path / "generated"
+    generated.mkdir()
+    (generated / "drop.py").write_text("x = 1")
+    (generated / "keep.py").write_text("x = 2")
+
+    result = detect(tmp_path)
+    file_list = result["files"]["code"]
+    assert not any("drop.py" in f for f in file_list)
+    assert any("keep.py" in f for f in file_list)
+    assert result["gitignore_loaded"] is True
+
+
+def test_detect_keeps_memory_dir_when_gitignored(tmp_path):
+    """graphify-out/memory stays discoverable even when graphify-out/ is gitignored."""
+    (tmp_path / ".gitignore").write_text("graphify-out/\n")
+    memory_dir = tmp_path / "graphify-out" / "memory"
+    memory_dir.mkdir(parents=True)
+    (memory_dir / "note.md").write_text("# Note\n\nremember this")
+
+    result = detect(tmp_path)
+    file_list = result["files"]["document"]
+    assert any("graphify-out/memory/note.md" in f for f in file_list)
+
+
+def test_gitignore_nested_file_is_applied(tmp_path):
+    """Rules in nested .gitignore files should apply relative to that directory."""
+    subdir = tmp_path / "sub"
+    subdir.mkdir()
+    (subdir / ".gitignore").write_text("generated.py\n")
+    (subdir / "generated.py").write_text("x = 1")
+    (subdir / "keep.py").write_text("x = 2")
+
+    result = detect(tmp_path)
+    file_list = result["files"]["code"]
+    assert not any("sub/generated.py" in f for f in file_list)
+    assert any("sub/keep.py" in f for f in file_list)
+
+
+def test_gitignore_leading_slash_only_matches_root(tmp_path):
+    """A leading slash anchors the ignore rule to the directory that defines it."""
+    (tmp_path / ".gitignore").write_text("/generated/\n")
+    root_generated = tmp_path / "generated"
+    root_generated.mkdir()
+    (root_generated / "skip.py").write_text("x = 1")
+    nested_generated = tmp_path / "src" / "generated"
+    nested_generated.mkdir(parents=True)
+    (nested_generated / "keep.py").write_text("x = 2")
+
+    result = detect(tmp_path)
+    file_list = result["files"]["code"]
+    assert not any("/generated/skip.py" in f for f in file_list)
+    assert any("src/generated/keep.py" in f for f in file_list)
+
+
 def test_detect_follows_symlinked_directory(tmp_path):
     real_dir = tmp_path / "real_lib"
     real_dir.mkdir()

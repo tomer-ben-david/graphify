@@ -4,6 +4,7 @@ import fnmatch
 import json
 import os
 import re
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
@@ -243,54 +244,107 @@ def _is_noise_dir(part: str) -> bool:
     return False
 
 
-def _load_graphifyignore(root: Path) -> list[str]:
-    """Read .graphifyignore from root and return a list of patterns.
+def _load_ignore_file(path: Path) -> list[str]:
+    """Read an ignore file (e.g. .graphifyignore, .gitignore) and return patterns.
 
     Lines starting with # are comments. Blank lines are ignored.
     Patterns follow gitignore semantics: glob matched against the path
     relative to root. A leading slash anchors to root. A trailing slash
     matches directories only (we match both dir and file for simplicity).
     """
-    ignore_file = root / ".graphifyignore"
-    if not ignore_file.exists():
+    if not path.exists():
         return []
     patterns = []
-    for line in ignore_file.read_text(errors="ignore").splitlines():
+    for line in path.read_text(errors="ignore").splitlines():
         line = line.strip()
         if line and not line.startswith("#"):
             patterns.append(line)
     return patterns
 
 
-def _is_ignored(path: Path, root: Path, patterns: list[str]) -> bool:
-    """Return True if path matches any .graphifyignore pattern."""
-    if not patterns:
-        return False
+def _load_graphifyignore(root: Path) -> list[str]:
+    """Read .graphifyignore from root and return a list of patterns."""
+    return _load_ignore_file(root / ".graphifyignore")
+
+
+@dataclass(frozen=True)
+class GitIgnoreRule:
+    base_dir: Path
+    pattern: str
+    negated: bool
+
+
+def _load_gitignore(root: Path) -> list[GitIgnoreRule]:
+    """Read .gitignore from root and preserve ordered negation rules."""
+    return _load_gitignore_file(root / ".gitignore")
+
+
+def _load_gitignore_file(path: Path) -> list[GitIgnoreRule]:
+    """Read one .gitignore file and bind rules to its containing directory."""
+    rules: list[GitIgnoreRule] = []
+    for line in _load_ignore_file(path):
+        negated = line.startswith("!") and len(line) > 1
+        pattern = line[1:] if negated else line
+        if pattern:
+            rules.append(
+                GitIgnoreRule(
+                    base_dir=path.parent,
+                    pattern=pattern,
+                    negated=negated,
+                )
+            )
+    return rules
+
+
+def _matches_ignore_pattern(path: Path, root: Path, pattern: str, *, base_dir: Path | None = None) -> bool:
+    """Return True if a path matches one ignore pattern."""
+    base_path = base_dir or root
     try:
-        rel = str(path.relative_to(root))
+        rel = str(path.relative_to(base_path))
     except ValueError:
         return False
     rel = rel.replace(os.sep, "/")
     parts = rel.split("/")
-    for pattern in patterns:
-        # Normalize: strip leading/trailing slashes for matching purposes
-        p = pattern.strip("/")
-        if not p:
-            continue
-        # Match against full relative path
-        if fnmatch.fnmatch(rel, p):
+    anchored = pattern.startswith("/")
+    directory_pattern = pattern.endswith("/")
+    normalized = pattern.strip("/")
+    if not normalized:
+        return False
+
+    if anchored:
+        # Leading "/" is anchored to the directory containing the .gitignore file.
+        if fnmatch.fnmatch(rel, normalized):
             return True
-        # Match against filename alone
-        if fnmatch.fnmatch(path.name, p):
+        if directory_pattern:
+            for i in range(len(parts)):
+                if fnmatch.fnmatch("/".join(parts[: i + 1]), normalized):
+                    return True
+        return False
+
+    if "/" in normalized and fnmatch.fnmatch(rel, normalized):
+        return True
+    if "/" not in normalized and fnmatch.fnmatch(path.name, normalized):
+        return True
+    for i, part in enumerate(parts):
+        if "/" not in normalized and fnmatch.fnmatch(part, normalized):
             return True
-        # Match against any path segment or prefix
-        # e.g. "vendor" or "vendor/" should match "vendor/lib.py"
-        for i, part in enumerate(parts):
-            if fnmatch.fnmatch(part, p):
-                return True
-            if fnmatch.fnmatch("/".join(parts[:i + 1]), p):
-                return True
+        if fnmatch.fnmatch("/".join(parts[:i + 1]), normalized):
+            return True
     return False
+
+
+def _is_ignored(path: Path, root: Path, patterns: list[str]) -> bool:
+    """Return True if path matches any .graphifyignore pattern."""
+    return any(_matches_ignore_pattern(path, root, pattern) for pattern in patterns)
+
+
+def _is_gitignored(path: Path, root: Path, rules: list[GitIgnoreRule]) -> bool:
+    """Return True if ordered .gitignore rules exclude this path."""
+    ignored = False
+    for rule in rules:
+        if _matches_ignore_pattern(path, root, rule.pattern, base_dir=rule.base_dir):
+            ignored = not rule.negated
+    return ignored
 
 
 def detect(root: Path, *, follow_symlinks: bool = False) -> dict:
@@ -303,7 +357,8 @@ def detect(root: Path, *, follow_symlinks: bool = False) -> dict:
     total_words = 0
 
     skipped_sensitive: list[str] = []
-    ignore_patterns = _load_graphifyignore(root)
+    graphifyignore_patterns = _load_graphifyignore(root)
+    root_gitignore_rules = _load_gitignore(root)
 
     # Always include graphify-out/memory/ - query results filed back into the graph
     memory_dir = root / "graphify-out" / "memory"
@@ -312,12 +367,21 @@ def detect(root: Path, *, follow_symlinks: bool = False) -> dict:
         scan_paths.append(memory_dir)
 
     seen: set[Path] = set()
-    all_files: list[Path] = []
+    all_files: list[tuple[Path, list[GitIgnoreRule]]] = []
+    rules_by_dir: dict[Path, list[GitIgnoreRule]] = {root: root_gitignore_rules}
 
     for scan_root in scan_paths:
         in_memory_tree = memory_dir.exists() and str(scan_root).startswith(str(memory_dir))
         for dirpath, dirnames, filenames in os.walk(scan_root, followlinks=follow_symlinks):
             dp = Path(dirpath)
+            active_gitignore_rules = rules_by_dir.get(dp, root_gitignore_rules)
+            local_gitignore = dp / ".gitignore"
+            if local_gitignore.exists() and dp != root:
+                active_gitignore_rules = [
+                    *active_gitignore_rules,
+                    *_load_gitignore_file(local_gitignore),
+                ]
+                rules_by_dir[dp] = active_gitignore_rules
             if follow_symlinks and os.path.islink(dirpath):
                 real = os.path.realpath(dirpath)
                 parent_real = os.path.realpath(os.path.dirname(dirpath))
@@ -330,17 +394,21 @@ def detect(root: Path, *, follow_symlinks: bool = False) -> dict:
                     d for d in dirnames
                     if not d.startswith(".")
                     and not _is_noise_dir(d)
-                    and not _is_ignored(dp / d, root, ignore_patterns)
+                    and not _is_ignored(dp / d, root, graphifyignore_patterns)
+                    and not _is_gitignored(dp / d, root, active_gitignore_rules)
                 ]
+                for dirname in dirnames:
+                    child_dir = dp / dirname
+                    rules_by_dir[child_dir] = active_gitignore_rules
             for fname in filenames:
                 p = dp / fname
                 if p not in seen:
                     seen.add(p)
-                    all_files.append(p)
+                    all_files.append((p, active_gitignore_rules))
 
     converted_dir = root / "graphify-out" / "converted"
 
-    for p in all_files:
+    for p, gitignore_rules in all_files:
         # For memory dir files, skip hidden/noise filtering
         in_memory = memory_dir.exists() and str(p).startswith(str(memory_dir))
         if not in_memory:
@@ -351,7 +419,9 @@ def detect(root: Path, *, follow_symlinks: bool = False) -> dict:
             # Skip files inside our own converted/ dir (avoid re-processing sidecars)
             if str(p).startswith(str(converted_dir)):
                 continue
-        if _is_ignored(p, root, ignore_patterns):
+        if _is_ignored(p, root, graphifyignore_patterns):
+            continue
+        if not in_memory and _is_gitignored(p, root, gitignore_rules):
             continue
         if _is_sensitive(p):
             skipped_sensitive.append(str(p))
@@ -395,7 +465,8 @@ def detect(root: Path, *, follow_symlinks: bool = False) -> dict:
         "needs_graph": needs_graph,
         "warning": warning,
         "skipped_sensitive": skipped_sensitive,
-        "graphifyignore_patterns": len(ignore_patterns),
+        "graphifyignore_patterns": len(graphifyignore_patterns),
+        "gitignore_loaded": (root / ".gitignore").exists(),
     }
 
 
